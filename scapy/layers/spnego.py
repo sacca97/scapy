@@ -40,6 +40,7 @@ from scapy.asn1fields import (
     ASN1F_STRING,
 )
 from scapy.asn1packet import ASN1_Packet
+from scapy.consts import WINDOWS
 from scapy.fields import (
     FieldListField,
     LEIntEnumField,
@@ -70,6 +71,7 @@ from scapy.layers.gssapi import (
     GSS_C_FLAGS,
     GSS_C_NO_CHANNEL_BINDINGS,
     GSS_S_BAD_MECH,
+    GSS_S_BAD_MIC,
     GSS_S_COMPLETE,
     GSS_S_CONTINUE_NEEDED,
     GSS_S_FAILURE,
@@ -128,6 +130,7 @@ _mechDissector = {
     "1.2.840.48018.1.2.2": Kerberos,  # MS KRB5 - Microsoft Kerberos 5
     "1.2.840.113554.1.2.2": Kerberos,  # Kerberos 5
     "1.2.840.113554.1.2.2.3": Kerberos,  # Kerberos 5 - User to User
+    "1.3.6.1.5.2.5": Kerberos,  # Kerberos 5 - IAKERB
 }
 
 
@@ -191,7 +194,7 @@ class SPNEGO_negTokenInit(ASN1_Packet):
         ),
         ASN1F_optional(ASN1F_FLAGS("reqFlags", None, _ContextFlags, implicit_tag=0x81)),
         ASN1F_optional(
-            ASN1F_PACKET("mechToken", None, SPNEGO_Token, explicit_tag=0xA2)
+            ASN1F_PACKET("mechToken", None, SPNEGO_Token, explicit_tag=0xA2),
         ),
         # [MS-SPNG] flavor !
         ASN1F_optional(
@@ -237,6 +240,10 @@ class SPNEGO_negTokenResp(ASN1_Packet):
         ),
         ASN1F_optional(
             ASN1F_PACKET("mechListMIC", None, SPNEGO_MechListMIC, explicit_tag=0xA3)
+        ),
+        # [MS-SPNG] Late Fallback Mechanism
+        ASN1F_optional(
+            ASN1F_PACKET("supportedMechs", None, SPNEGO_MechTypes, explicit_tag=0xA4)
         ),
     )
 
@@ -548,6 +555,7 @@ class SPNEGOSSP(SSP):
 
     __slots__ = [
         "ssps",
+        "SUPPORT_LATE_FALLBACK",
     ]
 
     auth_type = 0x09
@@ -555,16 +563,20 @@ class SPNEGOSSP(SSP):
     class STATE(SSP.STATE):
         FIRST = 1
         SUBSEQUENT = 2
+        MICONLY = 3
 
     class CONTEXT(SSP.CONTEXT):
         __slots__ = [
             "req_flags",
+            "IsAcceptor",
             "ssps",
-            "other_mechtypes",
-            "sent_mechtypes",
+            "server_mechtypes",
+            "client_mechtypes",
             "first_choice",
             "require_mic",
             "verified_mic",
+            "late_fallback_supported",
+            "late_fallback_negotiated",
             "ssp",
             "ssp_context",
             "ssp_mechtype",
@@ -573,18 +585,23 @@ class SPNEGOSSP(SSP):
 
         def __init__(
             self,
+            IsAcceptor: bool,
             ssps: List[SSP],
+            late_fallback_supported: bool,
             req_flags=None,
         ):
             self.state = SPNEGOSSP.STATE.FIRST
             self.req_flags = req_flags
+            self.IsAcceptor = IsAcceptor
             # Information used during negotiation
             self.ssps = ssps
-            self.other_mechtypes = None  # the mechtypes our peer requested
-            self.sent_mechtypes = None  # the mechtypes we sent when acting as a client
+            self.server_mechtypes = None  # the mechtypes the server requested
+            self.client_mechtypes = None  # the mechtypes the client requested
             self.first_choice = True  # whether the SSP was the peer's first choice
             self.require_mic = False  # whether the mechListMIC is required or not
             self.verified_mic = False  # whether mechListMIC has been verified
+            self.late_fallback_supported = late_fallback_supported
+            self.late_fallback_negotiated = False  # [MS-SPNG] exclusive
             # Information about the currently selected SSP
             self.ssp = None
             self.ssp_context = None
@@ -594,11 +611,13 @@ class SPNEGOSSP(SSP):
 
         # This is the order Windows chooses
         _PREF_ORDER = [
-            "1.2.840.113554.1.2.2.3",  # Kerberos 5 - User to User
             "1.2.840.48018.1.2.2",  # MS KRB5
             "1.2.840.113554.1.2.2",  # Kerberos 5
+            "1.3.6.1.5.2.5",  # Kerberos 5 - IAKERB
             "1.3.6.1.4.1.311.2.2.30",  # NEGOEX
+            "1.2.840.113554.1.2.2.3",  # Kerberos 5 - User to User
             "1.3.6.1.4.1.311.2.2.10",  # NTLM
+            "1.3.6.1.4.1.311.2.2.40",  # Late Fallback
         ]
 
         def get_supported_mechtypes(self):
@@ -610,11 +629,38 @@ class SPNEGOSSP(SSP):
             for ssp in self.ssps:
                 mechs.extend(ssp.GSS_Inquire_names_for_mech())
 
-            # 2. Sort according to the preference order.
-            mechs.sort(key=lambda x: self._PREF_ORDER.index(x))
+            # Windows 24H2 / Server 2025+
+            if self.late_fallback_supported:
+                mechs.append("1.3.6.1.4.1.311.2.2.40")  # SPNEGO Late Fallback
 
-            # 3. Return wrapped in MechType
+            # 2. Sort according to the selected SSP, then the preference order
+            selected_mech_oids = (
+                self.ssp.GSS_Inquire_names_for_mech() if self.ssp else []
+            )
+            mechs.sort(
+                key=lambda x: (x not in selected_mech_oids, self._PREF_ORDER.index(x))
+            )
+
+            # 4. Return wrapped in MechType
             return [SPNEGO_MechType(oid=ASN1_OID(oid)) for oid in mechs]
+
+        def get_mechListMIC(self):
+            """
+            Return the binary used for mechListMIC
+            """
+            # See help(mechListMIC) for more details
+            mechtypes = self.client_mechtypes[:]
+
+            # [MS-SPNG] sect 3.1.5.1 - Late Fallback
+            # "When Negotiate Late Fallback is supported by both parties,
+            # mechListMIC consumes a list of all exchanged mechTypes and
+            # supportedMechs per the order of over-the-wire transmission
+            # with delimiters"
+            if self.late_fallback_negotiated:
+                # XXX Doesn't work. FIXME
+                mechtypes += self.server_mechtypes[:]
+
+            return mechListMIC(mechtypes)
 
         def negotiate_ssp(self) -> None:
             """
@@ -624,14 +670,28 @@ class SPNEGOSSP(SSP):
             common to both client and server. This also applies rules from
             [MS-SPNG] and RFC4178 to determine if mechListMIC is required.
             """
-            if self.other_mechtypes is None:
+            if not self.IsAcceptor:
+                other_mechtypes = self.server_mechtypes
+            else:
+                other_mechtypes = self.client_mechtypes
+
+            if other_mechtypes is None:
                 # We don't have any information about the peer's preferred SSPs.
                 # This typically happens on client side, when NegTokenInit2 isn't used.
                 self.ssp = self.ssps[0]
                 ssp_oid = self.ssp.GSS_Inquire_names_for_mech()[0]
             else:
                 # Get first common SSP between us and our peer
-                other_oids = [x.oid.val for x in self.other_mechtypes]
+                other_oids = [x.oid.val for x in other_mechtypes]
+
+                # See if the peer supports SPNEGO Late Fallback
+                if (
+                    self.late_fallback_supported
+                    and "1.3.6.1.4.1.311.2.2.40" in other_oids
+                ):
+                    self.late_fallback_negotiated = True
+
+                # Find first common SSP
                 try:
                     self.ssp, ssp_oid = next(
                         (ssp, requested_oid)
@@ -699,8 +759,14 @@ class SPNEGOSSP(SSP):
         def __repr__(self):
             return "SPNEGOSSP[%s]" % repr(self.ssp_context)
 
-    def __init__(self, ssps: List[SSP], **kwargs):
+    def __init__(
+        self,
+        ssps: List[SSP],
+        SUPPORT_LATE_FALLBACK=False,
+        **kwargs,
+    ):
         self.ssps = ssps
+        self.SUPPORT_LATE_FALLBACK = SUPPORT_LATE_FALLBACK
         super(SPNEGOSSP, self).__init__(**kwargs)
 
     @classmethod
@@ -719,10 +785,13 @@ class SPNEGOSSP(SSP):
         ccache: str = None,
         debug: int = 0,
         use_krb5ccname: bool = False,
+        use_winssp: bool = False,
     ):
         """
         Initialize a SPNEGOSSP from a list of many arguments.
-        This is useful in a CLI, with NTLM and Kerberos supported by default.
+
+        This is useful in a CLI, as it will try to build the best SPNEGOSSP
+        with NTLM and Kerberos based on the various parameters.
 
         :param UPN: the UPN of the user to use.
         :param target: the target IP/hostname entered by the user.
@@ -738,26 +807,44 @@ class SPNEGOSSP(SSP):
         :param ccache: (str) if provided, a path to a CCACHE (Kerberos)
         :param use_krb5ccname: (bool) if true, the KRB5CCNAME environment variable will
                                be used if available.
+        :param use_winssp: (bool) (only works on Windows). Use implicit authentication
+                           through WinSSP.
         """
         kerberos = True
+        domain_auth = True
         hostname = None
         # Check if target is a hostname / Check IP
-        if ":" in target:
+        if target and ":" in target:
             if not valid_ip6(target):
                 hostname = target
         else:
             if not valid_ip(target):
                 hostname = target
 
+        # If using WinSSP, this goes fast.
+        if use_winssp:
+            if not WINDOWS:
+                raise OSError("Cannot use WinSSP on a non-Windows computer !")
+            from scapy.arch.windows.sspi import WinSSP
+
+            return WinSSP()
+
         # Check UPN
         try:
             _, realm = _parse_upn(UPN)
             if realm == ".":
                 # Local
-                kerberos = False
+                domain_auth = False
         except ValueError:
-            # not a UPN: NTLM only
-            kerberos = False
+            # not a UPN
+            if hostname is not None:
+                # Fallback to support IAKERB without a UPN
+                domain_auth = False
+                realm = hostname
+                UPN = f"{UPN}@{realm}"
+            else:
+                # NTLM only
+                kerberos = False
 
         # If we're asked, check the environment for KRB5CCNAME
         if use_krb5ccname and ccache is None and "KRB5CCNAME" in os.environ:
@@ -793,10 +880,12 @@ class SPNEGOSSP(SSP):
                 t.open_ccache(ccache)
 
                 # Look for the ticket that we'll use. We chose:
-                # - either a ST if the SPN matches our target
+                # - either a ST if the UPN and SPN matches our target
+                # - or a ST that matches the UPN
                 # - else a TGT if we got nothing better
                 tgts = []
-                for i, (tkt, key, upn, spn) in enumerate(t.iter_tickets()):
+                sts = []
+                for i, (tkt, key, upn, spn) in t.enumerate_tickets():
                     spn, _ = _parse_spn(spn)
                     spn_host = spn.split("/")[-1]
                     # Check that it's for the correct user
@@ -806,14 +895,20 @@ class SPNEGOSSP(SSP):
                             # TGT. Keep it, and see if we don't have a better ST.
                             tgts.append(t.ssp(i))
                         elif hostname.lower() == spn_host.lower():
-                            # ST. We're done !
+                            # ST. UPN and SPN match. We're done !
                             ssps.append(t.ssp(i))
                             break
+                        else:
+                            # ST. UPN matches, Keep it
+                            sts.append(t.ssp(i))
                 else:
-                    # No ST found
+                    # No perfect ticket found
                     if tgts:
                         # Using a TGT !
                         ssps.append(tgts[0])
+                    elif sts:
+                        # Using a ST where at least the UPN matched !
+                        ssps.append(sts[0])
                     else:
                         # Nothing found
                         t.show()
@@ -840,13 +935,38 @@ class SPNEGOSSP(SSP):
                         EncryptionType.RC4_HMAC,
                         HashNt,
                     )
-                # Make a SSP that only has a UPN and secret.
+
+                # We have a UPN and secret. This allows to support 3 cases:
+                # Kerberos, IAKerb and U2U
+
+                # Normal Kerberos and U2U are only supported in domain environments
+                if domain_auth:
+                    ssps.extend(
+                        [
+                            KerberosSSP(
+                                UPN=UPN,
+                                PASSWORD=password,
+                                KEY=KEY,
+                                debug=debug,
+                            ),
+                            KerberosSSP(
+                                UPN=UPN,
+                                PASSWORD=password,
+                                KEY=KEY,
+                                debug=debug,
+                                U2U=True,
+                            ),
+                        ]
+                    )
+
+                # IAKERB is always supported when Kerberos is active
                 ssps.append(
                     KerberosSSP(
                         UPN=UPN,
                         PASSWORD=password,
                         KEY=KEY,
                         debug=debug,
+                        IAKERB=True,
                     )
                 )
             else:
@@ -884,7 +1004,11 @@ class SPNEGOSSP(SSP):
         Server-Initiation of GSSAPI/SPNEGO.
         See [MS-SPNG] sect 3.2.5.2
         """
-        Context = SPNEGOSSP.CONTEXT(list(self.ssps))
+        Context = SPNEGOSSP.CONTEXT(
+            IsAcceptor=True,
+            ssps=list(self.ssps),
+            late_fallback_supported=self.SUPPORT_LATE_FALLBACK,
+        )
         return (
             Context,
             GSSAPI_BLOB(
@@ -950,15 +1074,16 @@ class SPNEGOSSP(SSP):
         Guesses the mechtype of the peer when the "raw" fallback is used.
         """
         if isinstance(input_token, NTLM_Header):
-            Context.other_mechtypes = [
-                SPNEGO_MechType(oid=ASN1_OID("1.3.6.1.4.1.311.2.2.10"))
-            ]
+            other_mechtypes = [SPNEGO_MechType(oid=ASN1_OID("1.3.6.1.4.1.311.2.2.10"))]
         elif isinstance(input_token, Kerberos):
-            Context.other_mechtypes = [
-                SPNEGO_MechType(oid=ASN1_OID("1.2.840.48018.1.2.2"))
-            ]
+            other_mechtypes = [SPNEGO_MechType(oid=ASN1_OID("1.2.840.48018.1.2.2"))]
         else:
-            Context.other_mechtypes = []
+            other_mechtypes = []
+
+        if not Context.IsAcceptor:
+            Context.server_mechtypes = other_mechtypes
+        else:
+            Context.client_mechtypes = other_mechtypes
 
     def GSS_Init_sec_context(
         self,
@@ -971,7 +1096,9 @@ class SPNEGOSSP(SSP):
         if Context is None:
             # New Context
             Context = SPNEGOSSP.CONTEXT(
-                list(self.ssps),
+                IsAcceptor=False,
+                ssps=list(self.ssps),
+                late_fallback_supported=self.SUPPORT_LATE_FALLBACK,
                 req_flags=req_flags,
             )
 
@@ -987,13 +1114,17 @@ class SPNEGOSSP(SSP):
             if isinstance(input_token, SPNEGO_negTokenInit):
                 # We are handling a NegTokenInit2 request !
                 # Populate context with values from the server's request
-                Context.other_mechtypes = input_token.mechTypes
+                Context.server_mechtypes = input_token.mechTypes
             elif isinstance(input_token, SPNEGO_negTokenResp):
                 # Extract token and state from the client request
                 if input_token.responseToken is not None:
                     input_token_inner = input_token.responseToken.value
                 if input_token.negState is not None:
                     negState = input_token.negState
+
+                # [MS-SPNG] Late Fallback Mechanism
+                if input_token.supportedMechs is not None:
+                    Context.server_mechtypes = input_token.supportedMechs.mechTypes
             else:
                 # The blob is a raw token. We aren't using SPNEGO here.
                 Context.raw = True
@@ -1008,6 +1139,14 @@ class SPNEGOSSP(SSP):
                 # Couldn't find common SSP
                 log_runtime.warning("SPNEGOSSP: %s" % ex)
                 return Context, None, GSS_S_BAD_MECH
+
+        if Context.state == SPNEGOSSP.STATE.MICONLY:
+            # We have already finished the inner-ssp, and are just doing
+            # an extra exchange because we were asked for the mechListMIC.
+            if negState == 0:
+                return Context, None, GSS_S_COMPLETE
+            else:
+                return Context, None, GSS_S_BAD_MIC
 
         # Call inner-SSP
         Context.ssp_context, output_token_inner, status = (
@@ -1052,7 +1191,7 @@ class SPNEGOSSP(SSP):
             Context.ssp.VerifyMechListMIC(
                 Context.ssp_context,
                 input_token.mechListMIC.value,
-                mechListMIC(Context.sent_mechtypes),
+                Context.get_mechListMIC(),
             )
             Context.verified_mic = True
 
@@ -1061,12 +1200,12 @@ class SPNEGOSSP(SSP):
             return Context, None, status
         elif Context.state == SPNEGOSSP.STATE.FIRST:
             # First freeze the list of available mechtypes on the first message
-            Context.sent_mechtypes = Context.get_supported_mechtypes()
+            Context.client_mechtypes = Context.get_supported_mechtypes()
 
             # Now build the token
             spnego_tok = GSSAPI_BLOB(
                 innerToken=SPNEGO_negToken(
-                    token=SPNEGO_negTokenInit(mechTypes=Context.sent_mechtypes)
+                    token=SPNEGO_negTokenInit(mechTypes=Context.client_mechtypes)
                 )
             )
 
@@ -1090,13 +1229,15 @@ class SPNEGOSSP(SSP):
                 spnego_tok.token.mechListMIC = SPNEGO_MechListMIC(
                     value=Context.ssp.GetMechListMIC(
                         Context.ssp_context,
-                        mechListMIC(Context.sent_mechtypes),
+                        Context.get_mechListMIC(),
                     ),
                 )
 
                 # If we still haven't verified the MIC, we aren't done.
                 if not Context.verified_mic:
                     status = GSS_S_CONTINUE_NEEDED
+
+                Context.state = SPNEGOSSP.STATE.MICONLY
 
             # Add the output token if provided
             if output_token_inner:
@@ -1105,7 +1246,8 @@ class SPNEGOSSP(SSP):
                 )
 
         # Update the state
-        Context.state = SPNEGOSSP.STATE.SUBSEQUENT
+        if Context.state != SPNEGOSSP.STATE.MICONLY:
+            Context.state = SPNEGOSSP.STATE.SUBSEQUENT
 
         return Context, spnego_tok, status
 
@@ -1119,7 +1261,9 @@ class SPNEGOSSP(SSP):
         if Context is None:
             # New Context
             Context = SPNEGOSSP.CONTEXT(
-                list(self.ssps),
+                IsAcceptor=True,
+                ssps=list(self.ssps),
+                late_fallback_supported=self.SUPPORT_LATE_FALLBACK,
                 req_flags=req_flags,
             )
 
@@ -1134,7 +1278,7 @@ class SPNEGOSSP(SSP):
         if isinstance(input_token, SPNEGO_negTokenInit):
             # Populate context with values from the client's request
             if input_token.mechTypes:
-                Context.other_mechtypes = input_token.mechTypes
+                Context.client_mechtypes = input_token.mechTypes
             if input_token.mechToken:
                 input_token_inner = input_token.mechToken.value
             _mechListMIC = input_token.mechListMIC or input_token._mechListMIC
@@ -1148,7 +1292,7 @@ class SPNEGOSSP(SSP):
             input_token_inner = input_token
             self.GuessOtherMechtypes(Context, input_token)
 
-        if Context.other_mechtypes is None:
+        if Context.client_mechtypes is None:
             # At this point, we should have already gotten the mechtypes from a current
             # or former request.
             return Context, None, GSS_S_FAILURE
@@ -1193,7 +1337,7 @@ class SPNEGOSSP(SSP):
                 Context.ssp.VerifyMechListMIC(
                     Context.ssp_context,
                     _mechListMIC.value,
-                    mechListMIC(Context.other_mechtypes),
+                    Context.get_mechListMIC(),
                 )
                 Context.verified_mic = True
                 Context.require_mic = True
@@ -1225,7 +1369,7 @@ class SPNEGOSSP(SSP):
             spnego_tok.token.mechListMIC = SPNEGO_MechListMIC(
                 value=Context.ssp.GetMechListMIC(
                     Context.ssp_context,
-                    mechListMIC(Context.other_mechtypes),
+                    Context.get_mechListMIC(),
                 ),
             )
 
@@ -1246,7 +1390,11 @@ class SPNEGOSSP(SSP):
     ):
         if Context is None:
             # New Context
-            Context = SPNEGOSSP.CONTEXT(list(self.ssps))
+            Context = SPNEGOSSP.CONTEXT(
+                IsAcceptor=True,
+                ssps=list(self.ssps),
+                late_fallback_supported=self.SUPPORT_LATE_FALLBACK,
+            )
             Context.passive = True
 
         input_token_inner = None
@@ -1258,23 +1406,35 @@ class SPNEGOSSP(SSP):
             input_token = input_token.token
         if isinstance(input_token, SPNEGO_negTokenInit):
             if input_token.mechTypes is not None:
-                Context.other_mechtypes = input_token.mechTypes
+                if Context.IsAcceptor:
+                    # NegTokenInit
+                    Context.client_mechtypes = input_token.mechTypes
+                else:
+                    # NegTokenInit2
+                    Context.server_mechtypes = input_token.mechTypes
             if input_token.mechToken:
                 input_token_inner = input_token.mechToken.value
         elif isinstance(input_token, SPNEGO_negTokenResp):
             if input_token.supportedMech is not None:
-                Context.other_mechtypes = [input_token.supportedMech]
+                Context.server_mechtypes = [input_token.supportedMech]
             if input_token.responseToken:
                 input_token_inner = input_token.responseToken.value
         else:
             # Raw.
             input_token_inner = input_token
 
-        if Context.other_mechtypes is None:
+        # Get the mechtypes of the other peer
+        if Context.IsAcceptor:
+            other_mechtypes = Context.client_mechtypes
+        else:
+            other_mechtypes = Context.server_mechtypes
+
+        # If we still haven't got a mechtype, guess (raw, most likely)
+        if other_mechtypes is None:
             self.GuessOtherMechtypes(Context, input_token)
 
         # Uninitialized OR allowed mechtypes have changed
-        if Context.ssp is None or Context.ssp_mechtype not in Context.other_mechtypes:
+        if Context.ssp is None or Context.ssp_mechtype not in other_mechtypes:
             try:
                 Context.negotiate_ssp()
             except ValueError:
@@ -1291,6 +1451,7 @@ class SPNEGOSSP(SSP):
         return Context, status
 
     def GSS_Passive_set_Direction(self, Context: CONTEXT, IsAcceptor=False):
+        Context.IsAcceptor = IsAcceptor
         Context.ssp.GSS_Passive_set_Direction(
             Context.ssp_context, IsAcceptor=IsAcceptor
         )

@@ -76,9 +76,9 @@ This section tries to give many usage examples, but isn't exhaustive. For more d
     >>> load_module("ticketer")
     >>> t = Ticketer()
     >>> # If P12:
-    >>> t.request_tgt("Administrator@DOMAIN.LOCAL", p12="admin.pfx", ca="ca.pem")
+    >>> t.request_tgt(p12="admin.pfx", realm="DOMAIN.LOCAL", ca="ca.pem")
     >>> # One could also have used a different cert and key file:
-    >>> t.request_tgt("Administrator@DOMAIN.LOCAL", x509="admin.cert", x509key="admin.key", ca="ca.pem")
+    >>> t.request_tgt(x509="admin.cert", x509key="admin.key", realm="DOMAIN.LOCAL", ca="ca.pem")
 
 - **Request a user TGT with Kerberos armoring (FAST)**
 
@@ -159,6 +159,20 @@ The ``armor_with`` keyword allows to select a ticket to armor the request with.
    Start time         End time           Renew until        Auth time
    15/04/25 20:15:20  16/04/25 06:10:22  16/04/25 06:10:22  15/04/25 20:15:17
 
+- **Perform S4U2Self+U2U to get the PAC**
+
+.. code:: pycon
+
+   >>> load_module("ticketer")
+   >>> t = Ticketer()
+   >>> t.request_tgt("MyUser@domain.local", password="password")
+   >>> tgt, key, _ = t.export_krb(0)
+   >>> # Get PAC of Administrator@domain.local
+   >>> t.request_st(0, "MyUser@domain.local",
+   ...              for_user="Administrator@domain.local",
+   ...              u2u=True, additional_tickets=[tgt])
+   >>> t.export_krb(1)[0].encPart.decrypt(key).show()
+
 - **Request a ticket for a DMSA**
 
 For more information about DMSAs and how to create them, consult the `relevant Microsoft documentation <https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/delegated-managed-service-accounts/delegated-managed-service-accounts-set-up-dmsa>`_. In this example we allowed ``SERVER1$`` to retrieve the managed password of ``dmsa_user$``.
@@ -237,6 +251,23 @@ As you can see, DMSA keys were imported in the keytab. You can use those as deta
     Administrator@domain.local  15/04/25 20:24:13  3     RC4-HMAC
     
     No tickets in CCache.
+
+- **Create server keytab:**
+
+The following is equivalent to Windows' ``ktpass.exe /out kt.keytab /mapuser WKS02$@domain.local /princ host/WKS02.domain.local@domain.local /pass ScapyIsNice``.
+
+.. code:: pycon
+
+    >>> t = Ticketer()
+    >>> t.add_cred("host/WKS02.domain.local@domain.local", etypes="all", mapupn="WKS02$@domain.local", password="ScapyIsNice")
+    Enter password: ************
+    >>> t.show()
+    Keytab name: UNSAVED
+    Principal                              Timestamp          KVNO  Keytype
+    host/WKS02$.domain.local@domain.local  25/02/26 15:40:27  1     AES256-CTS-HMAC-SHA1-96
+
+    No tickets in CCache.
+    >>> t.save_keytab("kt.keytab")
 
 - **Change password using kpasswd in 'set' mode:**
 
@@ -369,6 +400,10 @@ Cheat sheet
 | ``t.request_st(i, spn, [...])``       | Request a ST using ticket i    |
 +---------------------------------------+--------------------------------+
 | ``t.renew(i, [...])``                 | Renew a TGT/ST                 |
++---------------------------------------+--------------------------------+
+| ``t.remove_krb(i)``                   | Remove a TGT/ST                |
++---------------------------------------+--------------------------------+
+| ``t.set_primary(i)``                  | Set the primary ticket         |
 +---------------------------------------+--------------------------------+
 
 Other useful commands

@@ -693,11 +693,23 @@ def in6_chksum(nh, u, p):
 #############################################################################
 #############################################################################
 
+nh_clserror = {socket.IPPROTO_TCP: TCPerror,
+               socket.IPPROTO_UDP: UDPerror}
+
 
 # Inherited by all extension header classes
 class _IPv6ExtHdr(_IPv6GuessPayload, Packet):
     name = 'Abstract IPv6 Option Header'
-    aliastypes = [IPv6, IPerror6]  # TODO ...
+    aliastypes = [IPv6]
+
+    def guess_payload_class(self, payload):
+        if self.nh in nh_clserror:
+            underlayer = self.underlayer
+            while underlayer:
+                if isinstance(underlayer, IPerror6):
+                    return nh_clserror[self.nh]
+                underlayer = underlayer.underlayer
+        return super(_IPv6ExtHdr, self).guess_payload_class(payload)
 
 
 #                    IPv6 options for Extension Headers                     #
@@ -1284,7 +1296,7 @@ def fragment6(pkt, fragSize):
 
     remain = fragPartStr
     res = []
-    fragOffset = 0     # offset, incremeted during creation
+    fragOffset = 0     # offset, incremented during creation
     fragId = random.randint(0, 0xffffffff)  # random id ...
     if fragHeader.id is not None:  # ... except id provided by user
         fragId = fragHeader.id
@@ -4220,7 +4232,7 @@ bind_layers(Ether, IPv6, type=0x86dd)
 bind_layers(CookedLinux, IPv6, proto=0x86dd)
 bind_layers(GRE, IPv6, proto=0x86dd)
 bind_layers(SNAP, IPv6, code=0x86dd)
-# AF_INET6 values are platform-dependent. For a detailed explaination, read
+# AF_INET6 values are platform-dependent. For a detailed explanation, read
 # https://github.com/the-tcpdump-group/libpcap/blob/f98637ad7f086a34c4027339c9639ae1ef842df3/gencode.c#L3333-L3354  # noqa: E501
 if WINDOWS:
     bind_layers(Loopback, IPv6, type=0x18)

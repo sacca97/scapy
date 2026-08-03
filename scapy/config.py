@@ -314,7 +314,10 @@ class LayersList(List[Type['scapy.packet.Packet']]):
         except ImportError:
             import __builtin__  # noqa: F401
         for lay in self.ldict:
-            doc = eval(lay).__doc__
+            try:
+                doc = eval(lay).__doc__
+            except AttributeError:
+                continue
             result.append((lay, doc.strip().split("\n")[0] if doc else lay))
         return result
 
@@ -649,7 +652,10 @@ class ExtsManager(importlib.abc.MetaPathFinder):
             return
 
         # Check the classifiers
-        if distr.metadata.get('License-Expression', None) not in self.GPLV2_LICENCES:
+        if (
+            distr.metadata.get('License-Expression', None) not in self.GPLV2_LICENCES
+            and distr.metadata.get('License', None) not in self.GPLV2_LICENCES
+        ):
             log_loading.warning(
                 "'%s' has no GPLv2 classifier therefore cannot be loaded." % extension
             )
@@ -1093,6 +1099,7 @@ class Conf(ConfClass):
         'gprs',
         'gssapi',
         'hsrp',
+        'igmp',
         'inet',
         'inet6',
         'ipsec',
